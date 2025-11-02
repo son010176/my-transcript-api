@@ -277,7 +277,7 @@ async def get_video_metadata(video_id: str):
             cookie_to_use = COOKIE_FILE_PATH
     
     cmd = [
-        YTDLP_PATH,
+        'yt-dlp',
         '--no-check-certificates',
         '--user-agent', DEFAULT_USER_AGENT,
         '--print-json',  # Yêu cầu in metadata ra JSON
