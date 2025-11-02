@@ -250,3 +250,86 @@ async def get_transcript(video_id: str):
                     os.remove(f)
         except Exception:
             pass
+
+@app.get("/metadata/{video_id}")
+async def get_video_metadata(video_id: str):
+    """
+    Lấy metadata (tiêu đề, thumbnail, thời lượng) của video từ yt-dlp.
+    """
+    # CHÚ Ý: Đảm bảo các biến YTDLP_PATH, COOKIE_FILE_PATH, ... 
+    # đã được định nghĩa ở đầu file main.py của bạn.
+    
+    # Tạo một đường dẫn tạm duy nhất cho cookiejar để tránh xung đột
+    # nếu /metadata và /transcript được gọi cùng lúc
+    tmp_cookie_jar = os.path.join(tempfile.gettempdir(), f'cookiejar_meta_{video_id}_{os.getpid()}.txt')
+    
+    # Sao chép cookie file từ secret sang /tmp/ (để yt-dlp có thể ghi)
+    cookie_to_use = None
+    try:
+        if os.path.exists(COOKIE_FILE_PATH):
+            shutil.copy2(COOKIE_FILE_PATH, tmp_cookie_jar)
+            os.chmod(tmp_cookie_jar, stat.S_IRUSR | stat.S_IWUSR)
+            cookie_to_use = tmp_cookie_jar
+    except Exception as e:
+        print(f"WARNING: Không thể sao chép cookie cho metadata: {e}")
+        # Nếu không copy được, thử dùng file gốc (có thể bị read-only)
+        if os.path.exists(COOKIE_FILE_PATH):
+            cookie_to_use = COOKIE_FILE_PATH
+    
+    cmd = [
+        YTDLP_PATH,
+        '--no-check-certificates',
+        '--user-agent', DEFAULT_USER_AGENT,
+        '--print-json',  # Yêu cầu in metadata ra JSON
+        '--skip-download', # Không tải video
+        f'https://www.youtube.com/watch?v={video_id}'
+    ]
+    
+    # Chỉ thêm cờ --cookies nếu chúng ta có file cookie
+    if cookie_to_use:
+        cmd.extend(['--cookies', cookie_to_use])
+
+    try:
+        # Chạy yt-dlp
+        rc, out, err = run_subprocess(cmd, timeout=15) # Timeout ngắn hơn cho metadata
+
+        if rc != 0:
+            print(f"YT-DLP Metadata Error Stderr: {err}")
+            if "sign in to confirm" in err.lower():
+                raise HTTPException(status_code=403, detail="YouTube chặn lấy metadata. Cookie có thể hết hạn.")
+            raise HTTPException(status_code=500, detail=f"Lỗi khi lấy metadata: {err[:200]}")
+
+        # Parse JSON output
+        metadata = json.loads(out)
+        
+        # Chỉ lấy các trường cần thiết
+        return {
+            "success": True,
+            "metadata": {
+                "title": metadata.get('title'),
+                "thumbnail": metadata.get('thumbnail'),
+                "duration_string": metadata.get('duration_string'),
+                "uploader": metadata.get('uploader'),
+                "upload_date": metadata.get('upload_date'),
+                "view_count": metadata.get('view_count')
+            }
+        }
+
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="Timeout khi lấy metadata.")
+    except json.JSONDecodeError:
+        print(f"YT-DLP Metadata Raw Output: {out}")
+        raise HTTPException(status_code=500, detail="Lỗi khi phân tích JSON metadata từ yt-dlp.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Lỗi server khi lấy metadata: {str(e)}")
+    finally:
+        # Dọn dẹp file cookie TẠM
+        if tmp_cookie_jar and os.path.exists(tmp_cookie_jar):
+            try:
+                os.remove(tmp_cookie_jar)
+            except Exception:
+                pass
