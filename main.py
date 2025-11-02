@@ -9,6 +9,8 @@ app = FastAPI()
 
 # ĐỊNH NGHĨA ĐƯỜNG DẪN COOKIE (KHỚP VỚI PATH TRÊN RENDER)
 COOKIE_FILE_PATH = '/etc/secrets/cookies.txt'
+# ĐỊNH NGHĨA ĐƯỜNG DẪN GHI COOKIE TẠM (TRONG THƯ MỤC /tmp/ CÓ THỂ GHI)
+COOKIE_JAR_PATH = '/tmp/yt-dlp-cookies.txt'
 
 def run_ytdlp_with_options(video_id: str, extra_args: list = None):
     """
@@ -18,10 +20,14 @@ def run_ytdlp_with_options(video_id: str, extra_args: list = None):
         'yt-dlp',
         '--no-check-certificates',
         '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        '--extractor-args', 'youtube:player_client=android,web',
         
-        # SỬA LỖI: Thêm cờ --cookies để sử dụng file cookie bí mật
+        # SỬA LỖI #2: Xóa cờ --extractor-args 'youtube:player_client=android,web' vì nó xung đột với --cookies
+        
+        # SỬA LỖI #1:
+        # --cookies: Đọc cookie từ file bí mật (Read-only)
         '--cookies', COOKIE_FILE_PATH,
+        # --cookiejar: Ghi cookie mới vào file tạm (Writable)
+        '--cookiejar', COOKIE_JAR_PATH, 
         
         '--write-auto-subs',
         '--skip-download',
@@ -57,6 +63,13 @@ async def get_transcript_route(video_id: str):
             except:
                 pass
         
+        # Xóa file cookiejar cũ nếu có
+        if os.path.exists(COOKIE_JAR_PATH):
+            try:
+                os.remove(COOKIE_JAR_PATH)
+            except:
+                pass
+
         # Chạy yt-dlp
         result = run_ytdlp_with_options(video_id)
         
@@ -68,18 +81,24 @@ async def get_transcript_route(video_id: str):
         if result.returncode != 0:
             error_msg = result.stderr.lower()
             
-            if 'sign in to confirm' in error_msg or 'bot' in error_msg:
+            # Lỗi OSError (Read-only) sẽ không còn, nhưng ta vẫn bắt lỗi cookie
+            if 'sign in to confirm' in error_msg or 'bot' in error_msg or 'authentication' in error_msg:
                 raise HTTPException(
                     status_code=403, 
-                    # Cập nhật thông báo lỗi để biết cookie có vấn đề
                     detail="YouTube chặn request. File cookie có thể đã hết hạn hoặc không hợp lệ."
                 )
             elif 'video unavailable' in error_msg or 'private video' in error_msg:
                 raise HTTPException(status_code=404, detail="Video không tồn tại, bị xóa hoặc riêng tư")
             elif 'no subtitles' in error_msg or 'no automatic captions' in error_msg:
-                raise HTTPException(status_code=404, detail="Video này không có phụ đề tự động")
+                # Bắt lỗi này sau khi debug
+                if 'c0xppyWRqHs has no automatic captions' in result.stdout:
+                     raise HTTPException(status_code=404, detail="Video này không có phụ đề (kể cả tự động).")
+                raise HTTPException(status_code=404, detail="Video này không có phụ đề tự động (vi/en).")
             else:
                 raise HTTPException(status_code=500, detail=f"Lỗi yt-dlp: {result.stderr[:200]}")
+        
+        # Đã bắt lỗi 'no automatic captions' ở trên, 
+        # nhưng nếu stdout không có mà stderr cũng không báo, ta kiểm tra file
         
         # Tìm file phụ đề
         subtitle_files = glob.glob(f'/tmp/{video_id}.*.json3')
@@ -90,7 +109,7 @@ async def get_transcript_route(video_id: str):
         if not subtitle_files:
             raise HTTPException(
                 status_code=404, 
-                detail="yt-dlp chạy thành công nhưng không tìm thấy file phụ đề. Video có thể không có CC."
+                detail="yt-dlp chạy thành công nhưng không tìm thấy file phụ đề. Video có thể không có CC (vi/en)."
             )
         
         # Ưu tiên .vi.json3 trước .en.json3
@@ -114,7 +133,6 @@ async def get_transcript_route(video_id: str):
                     for seg in event['segs']:
                         if 'utf8' in seg:
                             full_transcript += seg['utf8']
-        # Format JSON cũ (Dự phòng, mặc dù json3 thường dùng 'events')
         elif isinstance(subtitle_data, list):
             full_transcript = " ".join([item.get('text', '') for item in subtitle_data])
         else:
@@ -161,10 +179,12 @@ async def debug_transcripts(video_id: str):
                 'yt-dlp',
                 '--no-check-certificates',
                 '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                '--extractor-args', 'youtube:player_client=android,web',
                 
-                # SỬA LỖI: Thêm cờ --cookies để sử dụng file cookie bí mật
+                # SỬA LỖI #2: Xóa cờ --extractor-args
+                
+                # SỬA LỖI #1:
                 '--cookies', COOKIE_FILE_PATH,
+                '--cookiejar', COOKIE_JAR_PATH,
                 
                 '--list-subs',
                 f'https://www.youtube.com/watch?v={video_id}'
@@ -173,6 +193,9 @@ async def debug_transcripts(video_id: str):
             text=True,
             timeout=30
         )
+        
+        # Lỗi `OSError` sẽ không còn nữa vì `yt-dlp` sẽ không crash.
+        # Nó sẽ thoát với code 0 (nếu thành công) hoặc 1 (nếu có lỗi logic như không có sub).
         
         return {
             "video_id": video_id,
@@ -184,6 +207,7 @@ async def debug_transcripts(video_id: str):
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=504, detail="Timeout")
     except Exception as e:
+        # Bắt các lỗi khác (ví dụ: subprocess không chạy được)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -191,6 +215,6 @@ async def debug_transcripts(video_id: str):
 async def root():
     return {
         "message": "Transcript API with anti-bot bypass and cookie support", 
-        "version": "3.0", # Cập nhật version
+        "version": "3.1", # Cập nhật version
         "status": "ready"
     }
