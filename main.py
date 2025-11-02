@@ -1,6 +1,8 @@
 from fastapi import FastAPI, HTTPException
 import subprocess
 import json
+import os
+import glob
 import re
 
 app = FastAPI()
@@ -8,23 +10,29 @@ app = FastAPI()
 @app.get("/transcript/{video_id}")
 async def get_transcript_route(video_id: str): 
     """
-    Lấy phụ đề bằng yt-dlp (vượt qua các hạn chế của API)
+    Lấy phụ đề bằng yt-dlp (bao gồm cả phụ đề tự động)
     """
     try:
+        # Xóa các file cũ nếu có
+        old_files = glob.glob(f'/tmp/{video_id}.*')
+        for f in old_files:
+            try:
+                os.remove(f)
+            except:
+                pass
+        
         # Dùng yt-dlp để lấy phụ đề
-        # --write-auto-subs: Lấy cả phụ đề tự động
-        # --skip-download: Không tải video
-        # --sub-langs: Ưu tiên tiếng Việt, fallback sang tiếng Anh
+        # --write-auto-subs: Lấy phụ đề tự động
+        # --sub-langs: Ưu tiên vi, fallback en
+        # --convert-subs json: Convert sang JSON để dễ parse
         result = subprocess.run(
             [
                 'yt-dlp',
-                '--write-auto-subs',
-                '--write-subs',
+                '--write-auto-subs',  # Bắt buộc có cái này!
                 '--skip-download',
-                '--sub-langs', 'vi.*,en.*',
+                '--sub-langs', 'vi,en',  # Bỏ .* để lấy chính xác
                 '--convert-subs', 'json',
-                '--output', '/tmp/%(id)s.%(ext)s',
-                '--print', 'after_move:filepath',
+                '--output', f'/tmp/{video_id}',
                 f'https://www.youtube.com/watch?v={video_id}'
             ],
             capture_output=True,
@@ -33,60 +41,81 @@ async def get_transcript_route(video_id: str):
             cwd='/tmp'
         )
         
+        print(f"yt-dlp stdout: {result.stdout}")
+        print(f"yt-dlp stderr: {result.stderr}")
+        
         if result.returncode != 0:
             error_msg = result.stderr.lower()
             
-            if 'no suitable formats' in error_msg or 'video unavailable' in error_msg:
-                raise HTTPException(status_code=404, detail="Video không tồn tại hoặc bị hạn chế")
-            elif 'subtitles' in error_msg or 'no subtitles' in error_msg:
-                raise HTTPException(status_code=404, detail="Video này không có phụ đề")
+            if 'video unavailable' in error_msg or 'private video' in error_msg:
+                raise HTTPException(status_code=404, detail="Video không tồn tại hoặc bị riêng tư")
             else:
-                raise HTTPException(status_code=500, detail=f"Lỗi yt-dlp: {result.stderr[:200]}")
+                raise HTTPException(status_code=500, detail=f"Lỗi yt-dlp: {result.stderr[:300]}")
         
-        # Tìm file phụ đề vừa tải (ưu tiên .vi.json, sau đó .en.json)
-        import os
-        import glob
-        
-        subtitle_files = []
-        for pattern in [f'/tmp/{video_id}.vi*.json', f'/tmp/{video_id}.en*.json', f'/tmp/{video_id}.*.json']:
-            subtitle_files.extend(glob.glob(pattern))
+        # Tìm file phụ đề (ưu tiên .vi.json rồi đến .en.json)
+        subtitle_files = glob.glob(f'/tmp/{video_id}.*.json')
         
         if not subtitle_files:
-            raise HTTPException(status_code=404, detail="Không tìm thấy file phụ đề sau khi tải")
+            raise HTTPException(
+                status_code=404, 
+                detail="Video này không có phụ đề tự động. yt-dlp đã chạy nhưng không tìm thấy file."
+            )
         
-        # Đọc file phụ đề đầu tiên (ưu tiên tiếng Việt)
-        subtitle_file = sorted(subtitle_files, key=lambda x: ('vi' not in x, x))[0]
+        # Sắp xếp: ưu tiên .vi trước .en
+        subtitle_file = sorted(
+            subtitle_files, 
+            key=lambda x: (
+                '.vi.' not in x,  # vi lên đầu
+                '.en.' not in x,  # en thứ 2
+                x  # alphabet còn lại
+            )
+        )[0]
         
+        print(f"Đang đọc file: {subtitle_file}")
+        
+        # Đọc file phụ đề
         with open(subtitle_file, 'r', encoding='utf-8') as f:
             subtitle_data = json.load(f)
         
-        # Xử lý format JSON3 của YouTube
+        # Parse subtitle data
         full_transcript = ""
+        
+        # Format JSON3 (YouTube mới)
         if 'events' in subtitle_data:
-            # Format JSON3
             for event in subtitle_data['events']:
                 if 'segs' in event:
                     for seg in event['segs']:
                         if 'utf8' in seg:
-                            full_transcript += seg['utf8'] + " "
-        else:
-            # Format JSON cũ
+                            full_transcript += seg['utf8']
+        # Format JSON cũ
+        elif isinstance(subtitle_data, list):
             full_transcript = " ".join([item.get('text', '') for item in subtitle_data])
+        else:
+            raise HTTPException(status_code=500, detail="Format phụ đề không được hỗ trợ")
         
-        # Dọn dẹp files tạm
+        # Dọn dẹp files
         for f in subtitle_files:
             try:
                 os.remove(f)
             except:
                 pass
         
-        if not full_transcript.strip():
-            raise HTTPException(status_code=404, detail="Phụ đề rỗng")
+        # Loại bỏ các ký tự xuống dòng thừa
+        full_transcript = re.sub(r'\n+', ' ', full_transcript)
+        full_transcript = full_transcript.strip()
+        
+        if not full_transcript:
+            raise HTTPException(status_code=404, detail="Phụ đề rỗng sau khi parse")
+        
+        # Phát hiện ngôn ngữ từ tên file
+        language = "vi" if ".vi." in subtitle_file else "en" if ".en." in subtitle_file else "unknown"
         
         return {
             "video_id": video_id,
-            "transcript": full_transcript.strip(),
-            "length": len(full_transcript)
+            "transcript": full_transcript,
+            "language": language,
+            "length": len(full_transcript),
+            "file_used": os.path.basename(subtitle_file)
         }
         
     except subprocess.TimeoutExpired:
@@ -94,7 +123,9 @@ async def get_transcript_route(video_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi không xác định: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Lỗi: {str(e)}")
 
 
 @app.get("/debug/{video_id}")
@@ -114,8 +145,9 @@ async def debug_transcripts(video_id: str):
         
         return {
             "video_id": video_id,
-            "available_subtitles": result.stdout,
-            "stderr": result.stderr if result.returncode != 0 else None
+            "raw_output": result.stdout,
+            "has_error": result.returncode != 0,
+            "error": result.stderr if result.returncode != 0 else None
         }
         
     except subprocess.TimeoutExpired:
@@ -126,4 +158,4 @@ async def debug_transcripts(video_id: str):
 
 @app.get("/")
 async def root():
-    return {"message": "Transcript API is running with yt-dlp."}
+    return {"message": "Transcript API is running with yt-dlp support for auto-generated captions."}
