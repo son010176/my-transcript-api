@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from youtube_transcript_api import YouTubeTranscriptApi 
-from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
+from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound, NoTranscriptAvailable
 
 app = FastAPI()
 
@@ -11,42 +11,45 @@ async def get_transcript_route(video_id: str):
     Hỗ trợ cả phụ đề gốc và phụ đề dịch tự động.
     """
     transcript_list = None
+    used_method = ""
     
     try:
-        # Sử dụng phương thức list_transcripts để có thể translate
         transcript_list_obj = YouTubeTranscriptApi.list_transcripts(video_id)
         
-        # Bước 1: Thử tìm phụ đề tiếng Việt gốc
-        try:
-            transcript = transcript_list_obj.find_transcript(['vi'])
-            transcript_list = transcript.fetch()
-            print(f"✓ Tìm thấy phụ đề tiếng Việt gốc")
-        except NoTranscriptFound:
-            # Bước 2: Nếu không có phụ đề Việt gốc, thử dịch tự động sang tiếng Việt
+        # Thử các cách theo thứ tự ưu tiên
+        methods = [
+            # 1. Phụ đề tiếng Việt gốc
+            lambda: (transcript_list_obj.find_transcript(['vi']).fetch(), "Phụ đề Việt gốc"),
+            
+            # 2. Dịch tự động sang tiếng Việt từ phụ đề có sẵn
+            lambda: (transcript_list_obj.find_generated_transcript(['en', 'ko', 'ja', 'zh-Hans', 'zh-Hant', 'es', 'fr']).translate('vi').fetch(), "Dịch tự động sang Việt"),
+            
+            # 3. Phụ đề tiếng Anh gốc
+            lambda: (transcript_list_obj.find_transcript(['en']).fetch(), "Phụ đề Anh gốc"),
+            
+            # 4. Phụ đề tự động tiếng Anh
+            lambda: (transcript_list_obj.find_generated_transcript(['en']).fetch(), "Phụ đề Anh tự động"),
+            
+            # 5. Bất kỳ phụ đề manual nào
+            lambda: (next(iter(transcript_list_obj)).fetch(), "Phụ đề manual bất kỳ"),
+        ]
+        
+        for method in methods:
             try:
-                # Lấy bất kỳ transcript nào có thể dịch được
-                transcript = transcript_list_obj.find_generated_transcript(['en', 'ko', 'ja', 'zh-Hans', 'zh-Hant'])
-                # Dịch sang tiếng Việt
-                translated = transcript.translate('vi')
-                transcript_list = translated.fetch()
-                print(f"✓ Đã dịch tự động từ {transcript.language_code} sang tiếng Việt")
-            except:
-                # Bước 3: Thử lấy phụ đề tiếng Anh gốc
-                try:
-                    transcript = transcript_list_obj.find_transcript(['en'])
-                    transcript_list = transcript.fetch()
-                    print(f"✓ Tìm thấy phụ đề tiếng Anh gốc")
-                except NoTranscriptFound:
-                    # Bước 4: Lấy bất kỳ transcript nào có sẵn
-                    try:
-                        transcript = transcript_list_obj.find_generated_transcript(['en'])
-                        transcript_list = transcript.fetch()
-                        print(f"✓ Tìm thấy phụ đề tự động tiếng Anh")
-                    except:
-                        raise HTTPException(
-                            status_code=404, 
-                            detail="Video này không có phụ đề nào khả dụng."
-                        )
+                transcript_list, used_method = method()
+                print(f"✓ Thành công: {used_method}")
+                break
+            except (NoTranscriptFound, NoTranscriptAvailable, StopIteration):
+                continue
+            except Exception as e:
+                print(f"✗ Lỗi: {str(e)}")
+                continue
+        
+        if not transcript_list:
+            raise HTTPException(
+                status_code=404,
+                detail="Video này không có phụ đề nào khả dụng hoặc phụ đề đã bị tắt."
+            )
                         
     except TranscriptsDisabled:
         raise HTTPException(
@@ -56,10 +59,7 @@ async def get_transcript_route(video_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi không xác định: {str(e)}")
-    
-    if not transcript_list:
-        raise HTTPException(status_code=500, detail="Không thể lấy transcript")
+        raise HTTPException(status_code=500, detail=f"Lỗi: {str(e)}")
     
     # Nối các đoạn text lại
     full_transcript = " ".join([item['text'] for item in transcript_list])
@@ -67,34 +67,66 @@ async def get_transcript_route(video_id: str):
     return {
         "video_id": video_id, 
         "transcript": full_transcript,
+        "method": used_method,
         "length": len(full_transcript)
     }
 
-@app.get("/")
-async def root():
-    return {"message": "Transcript API is running."}
 
-
-# Endpoint debug để xem video có phụ đề gì
 @app.get("/debug/{video_id}")
 async def debug_transcripts(video_id: str):
     """Kiểm tra tất cả phụ đề có sẵn của video"""
     try:
         transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
         
-        available = []
-        for transcript in transcript_list:
-            available.append({
-                "language": transcript.language,
-                "language_code": transcript.language_code,
-                "is_generated": transcript.is_generated,
-                "is_translatable": transcript.is_translatable,
-                "translation_languages": list(transcript.translation_languages.keys())[:10] if transcript.is_translatable else []
-            })
+        manual_transcripts = []
+        generated_transcripts = []
+        
+        # Lấy thông tin về tất cả phụ đề
+        try:
+            for transcript in transcript_list:
+                info = {
+                    "language": transcript.language,
+                    "language_code": transcript.language_code,
+                    "is_generated": transcript.is_generated,
+                    "is_translatable": transcript.is_translatable,
+                }
+                
+                if transcript.is_translatable:
+                    # Lấy 10 ngôn ngữ dịch đầu tiên
+                    info["can_translate_to"] = list(transcript.translation_languages.keys())[:10]
+                
+                if transcript.is_generated:
+                    generated_transcripts.append(info)
+                else:
+                    manual_transcripts.append(info)
+        except Exception as e:
+            return {
+                "video_id": video_id,
+                "error": "Không thể lặp qua danh sách transcript",
+                "raw_error": str(e)
+            }
         
         return {
             "video_id": video_id,
-            "available_transcripts": available
+            "has_transcripts": len(manual_transcripts) > 0 or len(generated_transcripts) > 0,
+            "manual_transcripts": manual_transcripts,
+            "generated_transcripts": generated_transcripts,
+            "total": len(manual_transcripts) + len(generated_transcripts)
+        }
+        
+    except TranscriptsDisabled:
+        return {
+            "video_id": video_id,
+            "error": "Phụ đề đã bị tắt bởi chủ video"
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return {
+            "video_id": video_id,
+            "error": str(e),
+            "type": type(e).__name__
+        }
+
+
+@app.get("/")
+async def root():
+    return {"message": "Transcript API is running."}
