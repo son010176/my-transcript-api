@@ -19,7 +19,8 @@ def run_ytdlp_with_options(video_id: str, extra_args: list = None):
         '--write-auto-subs',
         '--skip-download',
         '--sub-langs', 'vi,en',
-        '--convert-subs', 'json',
+        # SỬA LỖI: Đổi từ --convert-subs 'json' sang --sub-format 'json3'
+        '--sub-format', 'json3', 
         '--output', f'/tmp/{video_id}',
         f'https://www.youtube.com/watch?v={video_id}'
     ]
@@ -74,11 +75,13 @@ async def get_transcript_route(video_id: str):
                 raise HTTPException(status_code=500, detail=f"Lỗi yt-dlp: {result.stderr[:200]}")
         
         # Tìm file phụ đề
-        subtitle_files = glob.glob(f'/tmp/{video_id}.*.json')
+        # SỬA LỖI: Tìm file .json3 thay vì .json
+        subtitle_files = glob.glob(f'/tmp/{video_id}.*.json3')
         
         if not subtitle_files:
             # Thử tìm với pattern khác
-            subtitle_files = glob.glob(f'/tmp/{video_id}*.json')
+            # SỬA LỖI: Tìm file .json3 thay vì .json
+            subtitle_files = glob.glob(f'/tmp/{video_id}*.json3')
         
         if not subtitle_files:
             raise HTTPException(
@@ -86,7 +89,7 @@ async def get_transcript_route(video_id: str):
                 detail="yt-dlp chạy thành công nhưng không tìm thấy file phụ đề. Video có thể không có CC."
             )
         
-        # Ưu tiên .vi.json trước .en.json
+        # Ưu tiên .vi.json3 trước .en.json3
         subtitle_file = sorted(
             subtitle_files, 
             key=lambda x: ('.vi.' not in x, '.en.' not in x, x)
@@ -107,11 +110,11 @@ async def get_transcript_route(video_id: str):
                     for seg in event['segs']:
                         if 'utf8' in seg:
                             full_transcript += seg['utf8']
-        # Format JSON cũ
+        # Format JSON cũ (Dự phòng, mặc dù json3 thường dùng 'events')
         elif isinstance(subtitle_data, list):
             full_transcript = " ".join([item.get('text', '') for item in subtitle_data])
         else:
-            raise HTTPException(status_code=500, detail="Format phụ đề không nhận dạng được")
+            raise HTTPException(status_code=500, detail="Format phụ đề không nhận dạng được (không phải json3)")
         
         # Cleanup
         for f in subtitle_files:
@@ -149,10 +152,12 @@ async def get_transcript_route(video_id: str):
 async def debug_transcripts(video_id: str):
     """Debug: xem phụ đề có sẵn"""
     try:
+        # Đã đồng bộ các tham số bypass bot
         result = subprocess.run(
             [
                 'yt-dlp',
-                '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                '--no-check-certificates',
+                '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 '--extractor-args', 'youtube:player_client=android,web',
                 '--list-subs',
                 f'https://www.youtube.com/watch?v={video_id}'
@@ -179,6 +184,6 @@ async def debug_transcripts(video_id: str):
 async def root():
     return {
         "message": "Transcript API with anti-bot bypass", 
-        "version": "2.0",
+        "version": "2.1", # Cập nhật version
         "status": "ready"
     }
