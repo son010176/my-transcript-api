@@ -7,6 +7,9 @@ import re
 
 app = FastAPI()
 
+# ĐỊNH NGHĨA ĐƯỜNG DẪN COOKIE (KHỚP VỚI PATH TRÊN RENDER)
+COOKIE_FILE_PATH = '/etc/secrets/cookies.txt'
+
 def run_ytdlp_with_options(video_id: str, extra_args: list = None):
     """
     Chạy yt-dlp với các options bypass bot detection
@@ -16,10 +19,13 @@ def run_ytdlp_with_options(video_id: str, extra_args: list = None):
         '--no-check-certificates',
         '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         '--extractor-args', 'youtube:player_client=android,web',
+        
+        # SỬA LỖI: Thêm cờ --cookies để sử dụng file cookie bí mật
+        '--cookies', COOKIE_FILE_PATH,
+        
         '--write-auto-subs',
         '--skip-download',
         '--sub-langs', 'vi,en',
-        # SỬA LỖI: Đổi từ --convert-subs 'json' sang --sub-format 'json3'
         '--sub-format', 'json3', 
         '--output', f'/tmp/{video_id}',
         f'https://www.youtube.com/watch?v={video_id}'
@@ -65,7 +71,8 @@ async def get_transcript_route(video_id: str):
             if 'sign in to confirm' in error_msg or 'bot' in error_msg:
                 raise HTTPException(
                     status_code=403, 
-                    detail="YouTube chặn request từ server. Video có thể bị hạn chế vùng hoặc yêu cầu đăng nhập."
+                    # Cập nhật thông báo lỗi để biết cookie có vấn đề
+                    detail="YouTube chặn request. File cookie có thể đã hết hạn hoặc không hợp lệ."
                 )
             elif 'video unavailable' in error_msg or 'private video' in error_msg:
                 raise HTTPException(status_code=404, detail="Video không tồn tại, bị xóa hoặc riêng tư")
@@ -75,12 +82,9 @@ async def get_transcript_route(video_id: str):
                 raise HTTPException(status_code=500, detail=f"Lỗi yt-dlp: {result.stderr[:200]}")
         
         # Tìm file phụ đề
-        # SỬA LỖI: Tìm file .json3 thay vì .json
         subtitle_files = glob.glob(f'/tmp/{video_id}.*.json3')
         
         if not subtitle_files:
-            # Thử tìm với pattern khác
-            # SỬA LỖI: Tìm file .json3 thay vì .json
             subtitle_files = glob.glob(f'/tmp/{video_id}*.json3')
         
         if not subtitle_files:
@@ -152,13 +156,16 @@ async def get_transcript_route(video_id: str):
 async def debug_transcripts(video_id: str):
     """Debug: xem phụ đề có sẵn"""
     try:
-        # Đã đồng bộ các tham số bypass bot
         result = subprocess.run(
             [
                 'yt-dlp',
                 '--no-check-certificates',
                 '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 '--extractor-args', 'youtube:player_client=android,web',
+                
+                # SỬA LỖI: Thêm cờ --cookies để sử dụng file cookie bí mật
+                '--cookies', COOKIE_FILE_PATH,
+                
                 '--list-subs',
                 f'https://www.youtube.com/watch?v={video_id}'
             ],
@@ -183,7 +190,7 @@ async def debug_transcripts(video_id: str):
 @app.get("/")
 async def root():
     return {
-        "message": "Transcript API with anti-bot bypass", 
-        "version": "2.1", # Cập nhật version
+        "message": "Transcript API with anti-bot bypass and cookie support", 
+        "version": "3.0", # Cập nhật version
         "status": "ready"
     }
